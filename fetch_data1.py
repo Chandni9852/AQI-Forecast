@@ -60,5 +60,5 @@ df = aq_df.join(w_df, how="inner")
 
 # Save
 df.to_csv("air_quality_dataset.csv")
-print("✔ Dataset saved as air_quality_dataset.csv")
+print("Dataset saved as air_quality_dataset.csv")
 print(df.head())
