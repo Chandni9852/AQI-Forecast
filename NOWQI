@@ -1,0 +1,275 @@
+import streamlit as st
+import pandas as pd
+import requests
+import joblib # Using joblib to load the model for consistency
+from xgboost import XGBRegressor
+import io
+
+# --- Configuration ---
+# Set the desired city here
+CITY = "Delhi"
+MODEL_FILE = "model.pkl" # The model file provided previously
+
+# --- AQI Calculation Function (Indian CPCB PM2.5 standard) ---
+def calculate_pm25_aqi(pm25):
+    """Calculates AQI (Sub-Index) from PM2.5 concentration (ug/m3) using Indian CPCB standard."""
+    if pm25 is None or pd.isna(pm25) or pm25 < 0:
+        return None, "N/A"
+
+    # AQI Breakpoints (CPCB PM2.5): (C_low, C_high, I_low, I_high, Category)
+    # Concentration (C), Index (I)
+    breakpoints = [
+        (0.0, 30.0, 0, 50, "Good",'😁'),
+        (30.1, 60.0, 51, 100, "Satisfactory",'🙂'),
+        (60.1, 90.0, 101, 200, "Moderately Polluted",'😥'),
+        (90.1, 120.0, 201, 300, "Poor",'😷'),
+        (120.1, 250.0, 301, 400, "Very Poor",'😶‍🌫️😞'),
+        (250.1, 380.0, 401, 500, "Severe",'😬🤒'),
+    ]
+
+    # Formula: I = [(I_high - I_low) / (C_high - C_low)] * (C - C_low) + I_low
+    for c_low, c_high, i_low, i_high, category in breakpoints:
+        if c_low <= pm25 <= c_high:
+            aqi = ((i_high - i_low) / (c_high - c_low)) * (pm25 - c_low) + i_low
+            return round(aqi), category
+
+    # Handle concentrations below the lowest breakpoint (0.0) or above the highest (380.0)
+    if pm25 > 380.0:
+        # CPCB officially lists Severe as 401-500 for 250.1-380.0, and often uses an open-ended
+        # range above 430 for PM10 and 250 for PM2.5, but caps the index at 500 in practice.
+        # For simplicity and clear categorization based on the available data,
+        # we'll extend the final category for higher concentrations.
+        # Note: The Severe category upper limit in CPCB is often treated as 500, but higher values
+        # can exist. The range above the last breakpoint (380 for PM2.5) is usually just categorized as "Severe."
+        return 500, "Severe (Extreme)" # Setting max AQI at 500 based on scale
+
+    return None, "N/A"
+
+# --- Utility to get color based on AQI category ---
+def get_aqi_color(category):
+    """Returns a hex color code based on the AQI category."""
+    colors = {
+        "Good": "green",
+        "Satisfactory": "#83be45", # Light Green/Lime
+        "Moderately Polluted": "yellow",
+        "Poor": "orange",
+        "Very Poor": "red",
+        "Severe": "purple",
+        "Severe (Extreme)": "maroon",
+        "N/A": "gray"
+    }
+    return colors.get(category, "gray")
+
+# --- Data Fetching and Prediction Logic ---
+@st.cache_data(ttl=600) # Cache the data for 10 minutes
+def fetch_latest_data(city):
+    """Fetches real-time air quality and weather data for the specified city."""
+    try:
+        # Step 1: Get coordinates for the city (Open-Meteo geocoding)
+        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1"
+        geo_res = requests.get(geo_url).json()
+
+        if "results" not in geo_res or len(geo_res["results"]) == 0:
+            st.error(f"City '{city}' not found by geocoding API.")
+            return None, None
+
+        lat = geo_res["results"][0]["latitude"]
+        lon = geo_res["results"][0]["longitude"]
+
+        # Step 2: Fetch AQI + Weather data
+        aq_url = (
+            f"https://air-quality-api.open-meteo.com/v1/air-quality?"
+            f"latitude={lat}&longitude={lon}&hourly=pm10,pm2_5,carbon_monoxide,"
+            f"nitrogen_dioxide,ozone,uv_index,uv_index_clear_sky"
+        )
+        weather_url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}&hourly=temperature_2m,"
+            f"relativehumidity_2m,pressure_msl,windspeed_10m"
+        )
+
+        aq_data = requests.get(aq_url).json()
+        weather_data = requests.get(weather_url).json()
+
+        # Step 3: Combine and Process DataFrames
+
+        # 1. AQI Data
+        aq_df = pd.DataFrame({
+            "datetime": aq_data["hourly"]["time"],
+            "pm25": aq_data["hourly"]["pm2_5"],
+            "pm10": aq_data["hourly"]["pm10"],
+            "no2": aq_data["hourly"]["nitrogen_dioxide"],
+            "o3": aq_data["hourly"]["ozone"],
+            "co": aq_data["hourly"]["carbon_monoxide"],
+        })
+        aq_df["datetime"] = pd.to_datetime(aq_df["datetime"])
+        aq_df.set_index("datetime", inplace=True)
+
+        # 2. Weather Data
+        w_df = pd.DataFrame({
+            "datetime": weather_data["hourly"]["time"],
+            "temp": weather_data["hourly"]["temperature_2m"],
+            "humidity": weather_data["hourly"]["relativehumidity_2m"],
+            "pressure": weather_data["hourly"]["pressure_msl"],
+            "wind_speed": weather_data["hourly"]["windspeed_10m"],
+        })
+        w_df["datetime"] = pd.to_datetime(w_df["datetime"])
+        w_df.set_index("datetime", inplace=True)
+
+        # Merge both. We need the current hour and the next hour for prediction.
+        df = aq_df.join(w_df, how="inner")
+        
+        # Keep only the last complete record (which is the current or last hour)
+        latest_record = df.iloc[[-1]].copy()
+        
+        # Prepare the data for prediction (dropping the target variable column 'pm25_next' 
+        # which is needed in training but not in live prediction, 
+        # and using the current 'pm25' as a feature). 
+        # For consistency with the training data columns, we select features used in training
+        feature_columns = ['pm25', 'pm10', 'no2', 'o3', 'co', 'temp', 'humidity', 'pressure', 'wind_speed']
+        latest_features = latest_record[feature_columns]
+
+        return latest_features, latest_record
+    
+    except requests.exceptions.RequestException as e:
+        st.error(f"API request failed: {e}")
+        return None, None
+    except Exception as e:
+        st.error(f"An unexpected error occurred during data fetching/processing: {e}")
+        return None, None
+
+def load_and_predict(features_df):
+    """Loads the model and predicts the next hour PM2.5 concentration."""
+    try:
+        # Load the XGBoost model from the uploaded file
+        # The uploaded file is accessible via its name, 'model.pkl'
+        with open(MODEL_FILE, 'rb') as f:
+            model = joblib.load(io.BytesIO(f.read()))
+
+        # The features need to be scaled/transformed if the original training data 
+        # had features like 'datetime' or 'pm25_next' which were dropped. 
+        # Assuming the provided features_df is correctly structured 
+        # (9 columns: 'pm25', 'pm10', 'no2', 'o3', 'co', 'temp', 'humidity', 'pressure', 'wind_speed')
+        
+        # Ensure column order matches the model's expected features
+        expected_features = model.get_booster().feature_names
+        
+        if features_df.empty or features_df.shape[1] != len(expected_features):
+             st.error("Prediction failed: Data structure mismatch. Ensure the feature set is complete.")
+             return None
+
+        # Predict next hour PM2.5
+        prediction = model.predict(features_df[expected_features])
+        
+        # The prediction is the next hour's PM2.5 concentration
+        predicted_pm25 = prediction[0]
+        
+        # Calculate AQI for the predicted PM2.5
+        predicted_aqi, aqi_category = calculate_pm25_aqi(predicted_pm25)
+
+        return predicted_pm25, predicted_aqi, aqi_category
+
+    except FileNotFoundError:
+        st.error(f"Model file '{MODEL_FILE}' not found. Please ensure it is uploaded.")
+        return None, None, None
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
+        return None, None, None
+
+# --- Streamlit UI ---
+
+def main():
+    st.set_page_config(
+        page_title="NOWQI - Air Quality Predictor",
+        layout="centered",
+        initial_sidebar_state="collapsed"
+    )
+    
+    st.title("⛅ NOWQI: Next Hour Air Quality Index (CPCB Standard)")
+    
+    # Text input for city selection
+    selected_city = st.text_input(
+        "Enter City Name:", 
+        value=CITY, 
+        key="city_input"
+    )
+    
+    st.markdown(f"""
+    <p style='font-size: small; color: gray;'>
+    **Forecasting next hour PM2.5 (particulate matter) concentration and AQI for: {selected_city}**
+    </p>
+    """, unsafe_allow_html=True)
+
+    if st.button("Get Forecast", type="primary"):
+        with st.spinner(f"Fetching data and predicting for {selected_city}..."):
+            
+            latest_features, latest_record = fetch_latest_data(selected_city)
+            
+            if latest_features is not None and not latest_features.empty:
+                predicted_pm25, predicted_aqi, aqi_category = load_and_predict(latest_features)
+
+                if predicted_pm25 is not None:
+                    
+                    st.success("Forecast Complete!")
+
+                    # --- Display Forecasted AQI ---
+                    aqi_color = get_aqi_color(aqi_category)
+                    
+                    st.markdown("---")
+                    st.subheader(f"Forecast for the Next Hour ({latest_record.index[0].hour + 1}:00 UTC)")
+                    
+                    # Custom card for AQI display
+                    st.markdown(f"""
+                    <div style="
+                        background-color: #f0f2f6; 
+                        padding: 20px; 
+                        border-radius: 10px; 
+                        border-left: 10px solid {aqi_color};
+                        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+                    ">
+                        <p style="font-size: 1.2rem; font-weight: bold; margin-bottom: 0px; color: #333;">
+                            Predicted AQI (Next Hour)
+                        </p>
+                        <h1 style="color: {aqi_color}; font-size: 4rem; margin-top: 5px;">
+                            {predicted_aqi if predicted_aqi is not None else 'N/A'}
+                        </h1>
+                        <p style="font-size: 1.5rem; font-weight: bold; margin-bottom: 5px; color: {aqi_color};">
+                            {aqi_category}
+                        </p>
+                        <p style="font-size: 1rem; margin-top: 0px; color: #555;">
+                            Predicted PM2.5: **{predicted_pm25:.2f} µg/m³**
+                        </p>
+                        <p style="font-size: 0.8rem; color: #888;">
+                            (Based on Indian CPCB standard for PM2.5)
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    st.markdown("---")
+                    
+                    # --- Display Latest Observed Data for Context ---
+                    st.subheader(f"Latest Observed Data (Current Hour: {latest_record.index[0].strftime('%Y-%m-%d %H:%M UTC')})")
+                    
+                    latest_data = latest_record.iloc[0]
+                    current_aqi, current_category = calculate_pm25_aqi(latest_data['pm25'])
+                    current_color = get_aqi_color(current_category)
+
+                    col1, col2, col3 = st.columns(3)
+
+                    col1.metric("Current PM2.5 (µg/m³)", f"{latest_data['pm25']:.2f}")
+                    col2.metric("Current AQI", f"{current_aqi} - {current_category}", delta_color="off")
+                    col3.metric("Temperature (°C)", f"{latest_data['temp']:.1f}")
+
+                    col4, col5, col6 = st.columns(3)
+                    col4.metric("Humidity (%)", f"{latest_data['humidity']:.1f}")
+                    col5.metric("Pressure (hPa)", f"{latest_data['pressure']:.1f}")
+                    col6.metric("Wind Speed (km/h)", f"{latest_data['wind_speed']:.1f}")
+                    
+                    with st.expander("Show full feature set used for prediction"):
+                        st.dataframe(latest_features.T, use_container_width=True)
+
+                else:
+                    st.error("Could not generate a prediction. Please check the model file and data structure.")
+
+if __name__ == "__main__":
+    main()
